@@ -50,7 +50,8 @@ import Core.Compiler:
     _methods_by_ftype,
     specialize_method,
     inlining_enabled,
-    typeinf # entry
+    typeinf, # entry
+    typeinf_ext_toplevel # entry for native compilation
 
 import Base:
     unwrap_unionall,
@@ -136,13 +137,14 @@ XOptimizationParams(; inlining::Bool                = inlining_enabled(),
 """
     X_CODE_CACHE::$(typeof(X_CODE_CACHE))
 
-Keeps `CodeInstance` cache associated with `mi::MethodInstace` that represent the result of
-an inference on `mi` performed by `XInterpreter`.
+Keeps `CodeInstance` associated with `mi::MethodInstace`, which is a customized compilation
+result of `mi` performed by `XInterpreter`.
 The cache is partitioned by identities of each `XInterpreter`, and thus running a pipeline
-with different configurations will yeild a different cache and never influenced by the
-previous inference.
-This cache is completely separated from the `NativeInterpreter`'s global cache, so that
-XCompiler.jl's analysis never interacts with actual code execution (like, execution of `XCompiler` itself).
+with different configurations will yeild a different cache and not be influenced by the
+previous compilation.
+This cache should be separated from the `NativeInterpreter`'s global cache, but currently
+code cache can be created in many different points of compilation pipeline, and thus a
+customized compilation will pollute the native cache.
 """
 const X_CODE_CACHE = IdDict{UInt, IdDict{MethodInstance,CodeInstance}}()
 
@@ -150,7 +152,7 @@ function maybe_init_cache!(cache_key::UInt)
     haskey(X_CODE_CACHE, cache_key) && return
     X_CODE_CACHE[cache_key] = IdDict{MethodInstance,CodeInstance}()
 end
-__clear_cache!()       = empty!(X_CODE_CACHE)
+__clear_cache!() = empty!(X_CODE_CACHE)
 
 function CC.code_cache(interp::XInterpreter)
     cache = XGlobalCache(interp)
@@ -158,38 +160,35 @@ function CC.code_cache(interp::XInterpreter)
     return WorldView(cache, worlds)
 end
 
-struct XGlobalCache
-    interp::XInterpreter
+struct XGlobalCache{Interp<:XInterpreter}
+    interp::Interp
 end
 
 # cache existence for this `analyzer` is ensured on its construction
-x_code_cache(interp::XInterpreter)         = X_CODE_CACHE[cache_key(interp)]
-x_code_cache(wvc::WorldView{XGlobalCache}) = x_code_cache(wvc.cache.interp)
+x_code_cache(interp::XInterpreter) = X_CODE_CACHE[cache_key(interp)]
+x_code_cache(wvc::WorldView{XGlobalCache{Interp}}) where Interp<:XInterpreter = x_code_cache(wvc.cache.interp)
 
-native_code_cache(interp::XInterpreter)         = CC.code_cache(native(interp))
-native_code_cache(wvc::WorldView{XGlobalCache}) = native_code_cache(wvc.cache.interp)
+native_code_cache(interp::XInterpreter) = CC.code_cache(native(interp))
+native_code_cache(wvc::WorldView{XGlobalCache{Interp}}) where Interp<:XInterpreter = native_code_cache(wvc.cache.interp)
 
-CC.haskey(wvc::WorldView{XGlobalCache}, mi::MethodInstance) = haskey(x_code_cache(wvc), mi)
+CC.haskey(wvc::WorldView{XGlobalCache{Interp}}, mi::MethodInstance) where Interp<:XInterpreter =
+    haskey(x_code_cache(wvc), mi)
 
-function CC.get(wvc::WorldView{XGlobalCache}, mi::MethodInstance, default)
-    x = get(x_code_cache(wvc), mi, default)
-    if x === default
-        return default
-    end
-    # now we can assume code exists within the native cache, just retrieve it
+function CC.get(wvc::WorldView{XGlobalCache{Interp}}, mi::MethodInstance, default) where Interp<:XInterpreter
+    r = get(x_code_cache(wvc), mi, default)
+    r !== default && return r
     return CC.get(native_code_cache(wvc), mi, default)
 end
 
-function CC.getindex(wvc::WorldView{XGlobalCache}, mi::MethodInstance)
+function CC.getindex(wvc::WorldView{XGlobalCache{Interp}}, mi::MethodInstance) where Interp<:XInterpreter
     r = CC.get(wvc, mi, nothing)
     r === nothing && throw(KeyError(mi))
     return r::CodeInstance
 end
 
-function CC.setindex!(wvc::WorldView{XGlobalCache}, ci::CodeInstance, mi::MethodInstance)
+function CC.setindex!(wvc::WorldView{XGlobalCache{Interp}}, ci::CodeInstance, mi::MethodInstance) where Interp<:XInterpreter
     x_code_cache(wvc)[mi] = ci
     add_x_callback!(mi) # register the callback on invalidation
-    CC.setindex!(native_code_cache(wvc), ci, mi) # bypass to the native cache
     return nothing
 end
 
@@ -241,44 +240,17 @@ CC.push!(inf_cache::XLocalCache, inf_result::InferenceResult) =
 # =====
 
 function with(@nospecialize(f), interp::XInterpreter)
-    tt = Tuple{Typeof(f)}
-    enter_gf_by_type!(interp, tt)
-    return f()
-end
+    x_typeinf_ext_toplevel(mi::MethodInstance, world::UInt) =
+        typeinf_ext_toplevel(interp, mi)
 
-# TODO `enter_call_builtin!` ?
-function enter_gf_by_type!(interp::XInterpreter,
-                           @nospecialize(tt::Type{<:Tuple}),
-                           world::UInt = get_world_counter(interp),
-                           )
-    mms = _methods_by_ftype(tt, InferenceParams(interp).MAX_METHODS, world)
-    @assert mms !== false "unable to find matching method for $(tt)"
-
-    filter!(mm->mm.spec_types===tt, mms)
-    @assert length(mms) == 1 "unable to find single target method for $(tt)"
-
-    mm = first(mms)::MethodMatch
-
-    return enter_method_signature!(interp, mm.method, mm.spec_types, mm.sparams)
-end
-
-function enter_method_signature!(interp::XInterpreter,
-                                 m::Method,
-                                 @nospecialize(atype),
-                                 sparams::SimpleVector,
-                                 world::UInt = get_world_counter(interp),
-                                 )
-    maybe_init_cache!(cache_key(interp))
-
-    mi = specialize_method(m, atype, sparams)
-
-    result = InferenceResult(mi)
-
-    frame = InferenceState(result, #= cached =# true, interp)
-
-    typeinf(interp, frame)
-
-    return interp, frame
+    try
+        ccall(:jl_set_typeinf_func, Cvoid, (Any,), x_typeinf_ext_toplevel)
+        return f()
+    catch err
+        rethrow(err)
+    finally
+        ccall(:jl_set_typeinf_func, Cvoid, (Any,), typeinf_ext_toplevel)
+    end
 end
 
 # exports
