@@ -1,0 +1,10 @@
+name = "XCompiler"
+uuid = "54bf1406-cb5f-4701-999c-8537b667339f"
+authors = ["Shuhei Kadowaki <aviatesk@gmail.com>"]
+version = "0.0.0"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
